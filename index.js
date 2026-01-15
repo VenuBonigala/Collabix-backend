@@ -4,10 +4,8 @@ const cors = require('cors');
 const http = require('http');
 const { Server } = require('socket.io');
 const Room = require('./models/Room');
-const { exec } = require('child_process');
-const fs = require('fs');
-const path = require('path');
-const AdmZip = require('adm-zip'); 
+const AdmZip = require('adm-zip');
+const axios = require('axios');
 require('dotenv').config();
 
 const authRoutes = require('./routes/auth');
@@ -24,9 +22,8 @@ const io = new Server(server, {
 app.use(cors());
 app.use(express.json());
 
-// --- STATE MAPS ---
-const userSocketMap = {}; // { socketId: username }
-const roomHostMap = {};   // { roomId: socketId } (Tracks who is the host)
+const userSocketMap = {};
+const roomHostMap = {};
 
 const DB_URL = process.env.MONGO_URI || "mongodb://127.0.0.1:27017/collabix";
 
@@ -36,7 +33,6 @@ mongoose.connect(DB_URL)
 
 app.use('/api/auth', authRoutes);
 
-// --- DOWNLOAD ZIP ROUTE ---
 app.get('/api/download/:roomId', async (req, res) => {
     try {
         const { roomId } = req.params;
@@ -66,16 +62,12 @@ app.get('/api/download/:roomId', async (req, res) => {
     }
 });
 
-// REMOVED: const defaultFiles = [...] 
-
 io.on('connection', (socket) => {
   
   socket.on('join-room', async ({ roomId, username }) => {
     userSocketMap[socket.id] = username;
     socket.join(roomId);
     
-    // 1. HOST ASSIGNMENT LOGIC
-    // If room has no host, this user becomes the host
     if (!roomHostMap[roomId]) {
         roomHostMap[roomId] = socket.id;
     }
@@ -88,43 +80,34 @@ io.on('connection', (socket) => {
         username: userSocketMap[clientId],
     }));
     
-    // Notify others
     clients.forEach((clientId) => {
         io.to(clientId).emit('user-joined', { socketId: socket.id, username });
     });
 
     let room = await Room.findOne({ roomId });
     if (!room) {
-        // UPDATED: Initialize with empty array for empty room
         room = await Room.create({ roomId, files: [] }); 
     }
 
     const filesPayload = {};
     room.files.forEach(file => filesPayload[file.name] = file);
 
-    // Send Join Data + Host Info
     socket.emit('joined', {
         clients: clientsList, 
         username,
         roomId,
         files: filesPayload,
-        hostId // Tell the user who the host is
+        hostId 
     });
 
-    // Broadcast updated host ID to everyone (just in case)
     io.to(roomId).emit('update-host', { hostId });
   });
 
-  // --- KICK USER (HOST ONLY) ---
   socket.on('kick-user', ({ roomId, targetSocketId }) => {
-      // Security: Check if requester is the host
       if (roomHostMap[roomId] === socket.id) {
-          // Tell the target they are kicked
           io.to(targetSocketId).emit('kicked');
-          // Force disconnect socket logic on server side
           io.sockets.sockets.get(targetSocketId)?.leave(roomId);
           
-          // Notify others
           const username = userSocketMap[targetSocketId] || "User";
           socket.in(roomId).emit('user-disconnected', { 
               socketId: targetSocketId, 
@@ -145,48 +128,51 @@ io.on('connection', (socket) => {
       socket.in(roomId).emit('line-change', { socketId: socket.id, lineNumber, fileName, username });
   });
 
-  socket.on('run-code', ({ language, code }) => {
+  socket.on('run-code', async ({ language, code }) => {
       if (!code) {
           socket.emit('code-output', { output: "Error: No code to run." });
           return;
       }
-      const tempDir = path.join(__dirname, 'temp');
-      if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir);
 
-      let fileName = `temp_${socket.id}`;
-      let command = '';
+      const runtimeMap = {
+          'javascript': { language: 'javascript', version: '18.15.0' },
+          'python': { language: 'python', version: '3.10.0' },
+          'java': { language: 'java', version: '15.0.2' },
+      };
 
-      if (language === 'python') {
-          fileName += '.py';
-          command = `python "${path.join(tempDir, fileName)}"`;
-      } else if (language === 'javascript') {
-          fileName += '.js';
-          command = `node "${path.join(tempDir, fileName)}"`;
-      } else if (language === 'java') {
-          fileName = 'Main.java'; 
-          const filePath = path.join(tempDir, fileName);
-          try { fs.unlinkSync(path.join(tempDir, 'Main.class')); } catch(e){}
-          command = `javac "${filePath}" && java -cp "${tempDir}" Main`;
-      } else {
+      const runtime = runtimeMap[language];
+
+      if (!runtime) {
           socket.emit('code-output', { output: "Language not supported." });
           return;
       }
 
-      const filePath = path.join(tempDir, fileName);
-
-      fs.writeFile(filePath, code, (err) => {
-          if (err) {
-              socket.emit('code-output', { output: "Error writing temp file." });
-              return;
-          }
-          exec(command, (error, stdout, stderr) => {
-              if (error) {
-                  socket.emit('code-output', { output: stderr || error.message, isError: true });
-              } else {
-                  socket.emit('code-output', { output: stdout, isError: false });
-              }
+      try {
+          const response = await axios.post('https://emkc.org/api/v2/piston/execute', {
+              language: runtime.language,
+              version: runtime.version,
+              files: [
+                  {
+                      name: language === 'java' ? 'Main.java' : undefined, 
+                      content: code
+                  }
+              ]
           });
-      });
+
+          const { run } = response.data;
+          
+          socket.emit('code-output', { 
+              output: run.output, 
+              isError: run.stderr.length > 0 
+          });
+
+      } catch (error) {
+          console.error("Execution Error:", error.message);
+          socket.emit('code-output', { 
+              output: "Failed to execute code via external API.", 
+              isError: true 
+          });
+      }
   });
 
   socket.on('file-created', async ({ roomId, fileName, type }) => {
@@ -226,19 +212,14 @@ io.on('connection', (socket) => {
   });
 
   socket.on('disconnect', () => {
-      // 2. HOST TRANSFER LOGIC
-      // Iterate through all rooms this socket was in (though usually just 1)
-      // Since socket.rooms is empty after disconnect, we must iterate the roomHostMap
       for (const roomId in roomHostMap) {
           if (roomHostMap[roomId] === socket.id) {
-              // The Host Left! Assign new host.
               const remainingClients = Array.from(io.sockets.adapter.rooms.get(roomId) || []);
               if (remainingClients.length > 0) {
-                  const newHostId = remainingClients[0]; // The next person becomes host
+                  const newHostId = remainingClients[0]; 
                   roomHostMap[roomId] = newHostId;
                   io.to(roomId).emit('update-host', { hostId: newHostId });
               } else {
-                  // Room is empty
                   delete roomHostMap[roomId];
               }
           }
