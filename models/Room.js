@@ -1,16 +1,19 @@
-const mongoose = require("mongoose");
 
+const mongoose = require('mongoose');
 const roomSchema = new mongoose.Schema({
-    roomId: { type: String, required: true, unique: true },
-    name: { type: String, default: "Untitled Room" }, // <--- ADD THIS
+    roomId: {
+        type: String,
+        required: true,
+        unique: true
+    },
     files: [
         {
             name: { type: String, required: true },
             type: { type: String, required: true }, // 'file' or 'folder'
-            language: { type: String }, // 'javascript', 'python', etc.
-            content: { type: String, default: "" }
+            content: { type: String, default: "" }, // <--- THIS WAS LIKELY MISSING
+            language: { type: String, default: "javascript" }
         }
     ]
-});
-
-module.exports = mongoose.model("Room", roomSchema);
+}, { timestamps: true });
+const Room = mongoose.model('Room', roomSchema);
+module.exports = Room;
