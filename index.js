@@ -116,12 +116,20 @@ io.on('connection', (socket) => {
       }
   });
 
+  // --- UPDATED SAVE LOGIC ---
   socket.on('code-change', async ({ roomId, fileName, code, originId }) => {
     socket.in(roomId).emit('code-change', { fileName, code, originId });
-    await Room.updateOne(
-        { roomId, "files.name": fileName },
-        { $set: { "files.$.content": code } }
-    );
+    try {
+        const result = await Room.updateOne(
+            { roomId, "files.name": fileName },
+            { $set: { "files.$.content": code } }
+        );
+        if (result.modifiedCount === 0) {
+            console.warn(`[Warning] Code saved but DB not updated for room: ${roomId}, file: ${fileName}`);
+        }
+    } catch (err) {
+        console.error("[Error] Failed to save code to DB:", err);
+    }
   });
 
   socket.on('line-change', ({ roomId, lineNumber, fileName, username }) => {
